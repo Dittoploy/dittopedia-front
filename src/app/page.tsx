@@ -1,4 +1,4 @@
-import { API_CONFIG, BackendStatus } from '@dittopedia/shared';
+import { API_CONFIG, EBackendStatus } from '@dittopedia/shared';
 
 export default function Home() {
   return (
@@ -8,7 +8,7 @@ export default function Home() {
         API version : <code className="font-mono">{API_CONFIG.VERSION}</code>
       </p>
       <span className="rounded-full bg-green-100 px-3 py-1 text-sm text-green-800">
-        {BackendStatus.UP}
+        {EBackendStatus.UP}
       </span>
     </main>
   );
