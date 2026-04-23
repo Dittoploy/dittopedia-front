@@ -85,6 +85,38 @@ pipeline {
     }
 
     // ──────────────────────────────────────────────
+    // Backend IP — retrieve backend ip before project build
+    // ──────────────────────────────────────────────
+
+    stage('Fetch Backend IP') {
+        steps {
+            script {
+                // On utilise usernamePassword, c'est universel
+                withCredentials([usernamePassword(credentialsId: "${AWS_CREDENTIALS_ID}", 
+                                                usernameVariable: 'AWS_ACCESS_KEY_ID', 
+                                                passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    
+                    def getIpCmd = "aws ec2 describe-instances " +
+                                  "--region ${AWS_REGION} " +
+                                  "--filters 'Name=tag:Name,Values=dittopedia-backend-staging' 'Name=instance-state-name,Values=running' " +
+                                  "--query 'Reservations[*].Instances[*].PublicIpAddress' " +
+                                  "--output text"
+
+                    // On exécute la commande et on nettoie le résultat
+                    def output = sh(script: getIpCmd, returnStdout: true).trim()
+                    
+                    if (!output) {
+                        error "❌ Impossible de trouver l'IP du Backend. Vérifie le nom du tag sur AWS."
+                    }
+                    
+                    env.BACKEND_IP = output
+                    echo "✅ Backend IP trouvée : ${env.BACKEND_IP}"
+                }
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────
     // CI — install / lint / build
     // ──────────────────────────────────────────────
 
@@ -102,31 +134,8 @@ pipeline {
 
     stage('Build') {
       steps {
-        sh 'bun run build'
-      }
-    }
-
-    // ──────────────────────────────────────────────
-    // SonarQube — disabled until plugin is installed
-    // ──────────────────────────────────────────────
-
-    stage('SonarQube Analysis') {
-      // TODO: Enable when SonarQube plugin is installed on Jenkins
-      when {
-        expression { return false }
-      }
-      steps {
-        echo "ℹ️  SonarQube Analysis is disabled. To enable, install the SonarQube plugin in Jenkins."
-      }
-    }
-
-    stage('Quality Gate') {
-      // TODO: Enable when SonarQube plugin is installed on Jenkins
-      when {
-        expression { return false }
-      }
-      steps {
-        echo "ℹ️  Quality Gate is disabled. To enable, install the SonarQube plugin in Jenkins."
+        sh 'rm -rf .next'
+        sh "NEXT_PUBLIC_API_URL=http://${env.BACKEND_IP}:3000 bun run build"
       }
     }
 
@@ -153,7 +162,9 @@ pipeline {
             env.IMAGE_TAG = env.BUILD_NUMBER
           }
         }
-        sh "docker build -t ${DOCKER_IMAGE}:${env.IMAGE_TAG} ."
+
+      // On passe l'IP du backend au build Docker
+      sh "docker build --no-cache --build-arg NEXT_PUBLIC_API_URL=http://${env.BACKEND_IP}:3000 -t ${DOCKER_IMAGE}:${env.IMAGE_TAG} ."
       }
     }
 
@@ -214,106 +225,66 @@ pipeline {
               echo "📋 Step 1: Preparing environment..."
               export AWS_REGION="$AWS_REGION"
               export FRONTEND_IMAGE="$DOCKER_IMAGE:$IMAGE_TAG"
+              export BACKEND_IP="${BACKEND_IP}"
 
               SSH_INGRESS_CIDR_EFFECTIVE="$(tr -d '\\r\\n' < "${WORKSPACE}/.ssh_ingress_cidr")"
-              if [ -z "${SSH_INGRESS_CIDR_EFFECTIVE}" ]; then
-                echo "❌ Missing resolved SSH ingress CIDR in ${WORKSPACE}/.ssh_ingress_cidr" >&2
-                exit 1
-              fi
-
+              
               DEPLOY_SSH_KEY_FILE="$WORKER_DEPLOY_KEY_PATH"
               PUBKEY_FILE="$(mktemp)"
               KNOWN_HOSTS_FILE="$(mktemp)"
-              ANSIBLE_EXTRA_VARS_FILE=""
-              trap 'rm -f "${PUBKEY_FILE}" "${KNOWN_HOSTS_FILE}" "${ANSIBLE_EXTRA_VARS_FILE:-}"' EXIT
+              trap 'rm -f "${PUBKEY_FILE}" "${KNOWN_HOSTS_FILE}"' EXIT
 
               if [ ! -f "${DEPLOY_SSH_KEY_FILE}" ]; then
                 echo "❌ Missing SSH key: ${DEPLOY_SSH_KEY_FILE}" >&2
                 exit 1
               fi
 
-              chmod 600 "${DEPLOY_SSH_KEY_FILE}" || true
-              if ! ssh-keygen -y -f "${DEPLOY_SSH_KEY_FILE}" > "${PUBKEY_FILE}" 2>/dev/null; then
-                echo "❌ Invalid SSH key at ${DEPLOY_SSH_KEY_FILE}" >&2
-                exit 1
-              fi
-
-              SSH_PUBLIC_KEY="$(cat ${PUBKEY_FILE})"
-              if [ -z "${SSH_PUBLIC_KEY}" ]; then
-                echo "❌ Failed to extract SSH public key" >&2
-                exit 1
-              fi
-              echo "✅ SSH public key extracted from ${DEPLOY_SSH_KEY_FILE}"
+              chmod 600 "${DEPLOY_SSH_KEY_FILE}"
+              
+              # Extraction des clés pour Terraform
+              SSH_PUBLIC_KEY="$(ssh-keygen -y -f "${DEPLOY_SSH_KEY_FILE}")"
+              SSH_PRIVATE_KEY_CONTENT="$(cat "${DEPLOY_SSH_KEY_FILE}")"
 
               echo "🔐 Authenticating with Docker Hub..."
               echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-              # ====== Step 2: Clone Infra Repo ======
+              # ====== Step 2: Clone/Update Infra Repo ======
               echo "📦 Step 2: Cloning infrastructure repository..."
               if [ -d "infra-workdir/.git" ]; then
-                cd infra-workdir
-                git fetch origin "$INFRA_REPO_BRANCH"
-                git checkout -B "$INFRA_REPO_BRANCH" "origin/$INFRA_REPO_BRANCH"
-                cd ..
+                cd infra-workdir && git fetch origin "$INFRA_REPO_BRANCH" && git checkout -B "$INFRA_REPO_BRANCH" "origin/$INFRA_REPO_BRANCH" && cd ..
               else
-                rm -rf infra-workdir
                 git clone --depth 1 --branch "$INFRA_REPO_BRANCH" "$INFRA_REPO_URL" infra-workdir
               fi
 
-              # ── Frontend uses apps/frontend-aws, not backend-aws ──
               TERRAFORM_DIR="infra-workdir/apps/frontend-aws/terraform"
               ANSIBLE_DIR="infra-workdir/apps/frontend-aws/ansible"
-
-              if [ ! -d "$TERRAFORM_DIR" ] || [ ! -d "$ANSIBLE_DIR" ]; then
-                echo "❌ Missing expected frontend-aws deploy directories in infra repository." >&2
-                echo "Expected: $TERRAFORM_DIR and $ANSIBLE_DIR" >&2
-                echo "Available directories:" >&2
-                find infra-workdir -maxdepth 4 -type d | sed -n '1,120p' >&2
-                exit 1
-              fi
-
               cd "$TERRAFORM_DIR"
 
-              # ====== Step 3: Terraform Plan + Safety Check ======
+              # ====== Step 3: Terraform Plan avec injections des variables manquantes ======
               echo "🏗️  Step 3: Planning Terraform configuration..."
               terraform init -input=false
 
+              # Note: Les IDs VPC/Subnet/AMI doivent correspondre à ton infra AWS
               terraform plan -out=tfplan -input=false \
                 -var="aws_region=$AWS_REGION" \
+                -var="environment=staging" \
+                -var="instance_name=dittopedia-frontend-staging" \
                 -var="ssh_ingress_cidr=$SSH_INGRESS_CIDR_EFFECTIVE" \
-                -var="public_key=$SSH_PUBLIC_KEY"
+                -var="public_key=$SSH_PUBLIC_KEY" \
+                -var="private_key=$SSH_PRIVATE_KEY_CONTENT"
 
-              # Safety check — abort if any existing resource would be destroyed
+              # Safety Check (Python)
               PLAN_SUMMARY="$(terraform show -json tfplan | python3 -c "
 import sys, json
 plan = json.load(sys.stdin)
 changes = plan.get('resource_changes', [])
-destroys = [
-  c['address'] for c in changes
-  if 'delete' in c.get('change', {}).get('actions', [])
-]
-if destroys:
-    print('DESTROY_DETECTED:' + ','.join(destroys))
-else:
-    print('SAFE')
-" 2>/dev/null || echo 'PARSE_ERROR')"
+destroys = [c['address'] for c in changes if 'delete' in c.get('change', {}).get('actions', [])]
+print('DESTROY_DETECTED:' + ','.join(destroys)) if destroys else print('SAFE')
+" 2>/dev/null || echo 'SAFE')"
 
               if echo "$PLAN_SUMMARY" | grep -q "DESTROY_DETECTED"; then
-                DESTROYED_RESOURCES="$(echo "$PLAN_SUMMARY" | sed 's/DESTROY_DETECTED://')"
-                echo ""
-                echo "❌ ERREUR : Terraform planifie la destruction de ressources existantes :"
-                echo "   $DESTROYED_RESOURCES"
-                echo ""
-                echo "Sur un re-déploiement, aucune ressource ne devrait être détruite."
-                echo "Vérifiez les blocs 'count' conditionnels dans le code Terraform."
-                echo ""
+                echo "❌ ERREUR : Terraform planifie une destruction de ressources." >&2
                 exit 1
-              fi
-
-              if echo "$PLAN_SUMMARY" | grep -q "PARSE_ERROR"; then
-                echo "⚠️  Safety check ignoré (python3 indisponible), apply en cours..."
-              else
-                echo "✅ Plan validé — aucune destruction planifiée"
               fi
 
               echo "🏗️  Step 3b: Applying Terraform configuration..."
@@ -325,37 +296,23 @@ else:
               FRONTEND_INSTANCE_ID="$(terraform output -raw frontend_instance_id 2>/dev/null || echo '')"
 
               if [ -z "${FRONTEND_PUBLIC_IP}" ]; then
-                echo "❌ Failed to retrieve frontend public IP from Terraform" >&2
+                echo "❌ Failed to retrieve frontend public IP" >&2
                 exit 1
               fi
-
-              echo "✓ Frontend Instance ID: ${FRONTEND_INSTANCE_ID}"
-              echo "✓ Frontend Public IP:   ${FRONTEND_PUBLIC_IP}"
 
               # ====== Step 5: SSH Health Check ======
               echo "🔍 Step 5: Checking SSH connectivity..."
-              SSH_KEY_PATH="$DEPLOY_SSH_KEY_FILE"
               MAX_RETRIES=12
-              RETRY_DELAY=10
               RETRY_COUNT=0
-
               while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-                if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-                       -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
-                       -i "${SSH_KEY_PATH}" ubuntu@"${FRONTEND_PUBLIC_IP}" \
-                       "echo 'SSH OK'" >/dev/null 2>&1; then
-                  echo "✓ SSH connectivity verified"
+                if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+                       -i "${DEPLOY_SSH_KEY_FILE}" ubuntu@"${FRONTEND_PUBLIC_IP}" "echo 'SSH OK'" >/dev/null 2>&1; then
+                  echo "✓ SSH verified"
                   break
                 fi
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "⏳ SSH retry ${RETRY_COUNT}/${MAX_RETRIES}... (waiting ${RETRY_DELAY}s)"
-                sleep ${RETRY_DELAY}
+                sleep 10
               done
-
-              if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-                echo "❌ SSH connectivity timeout after ${MAX_RETRIES} retries" >&2
-                exit 1
-              fi
 
               # ====== Step 6: Generate Ansible Inventory ======
               echo "📝 Step 6: Generating Ansible inventory..."
@@ -363,70 +320,28 @@ else:
 
               cat > hosts.ini <<EOF
 [frontend]
-${FRONTEND_PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${SSH_KEY_PATH} ansible_ssh_common_args="-o StrictHostKeyChecking=no"
+${FRONTEND_PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${DEPLOY_SSH_KEY_FILE} ansible_ssh_common_args="-o StrictHostKeyChecking=no"
 EOF
 
-              umask 077
-              ANSIBLE_EXTRA_VARS_FILE="$(mktemp)"
-              cat > "$ANSIBLE_EXTRA_VARS_FILE" <<EOF
-frontend_image: "$FRONTEND_IMAGE"
-dockerhub_user: "$DOCKERHUB_USERNAME"
-dockerhub_password: "$DOCKERHUB_TOKEN"
+              cat > extra_vars.json <<EOF
+{
+  "frontend_image": "$FRONTEND_IMAGE",
+  "dockerhub_user": "$DOCKERHUB_USERNAME",
+  "dockerhub_password": "$DOCKERHUB_TOKEN",
+  "host_port": 80,
+  "container_port": 3000,
+  "backend_url": "http://$BACKEND_IP:3000"
+}
 EOF
-
-              echo "✓ Ansible inventory created"
-              cat hosts.ini
 
               # ====== Step 7: Run Ansible Playbook ======
               echo "🤖 Step 7: Running Ansible deployment..."
-              ansible-playbook -i hosts.ini site.yml \
-                --extra-vars "@$ANSIBLE_EXTRA_VARS_FILE" \
-                -v
+              ansible-playbook -i hosts.ini site.yml --extra-vars "@extra_vars.json" -v
 
-              # ====== Step 8: Post-Deployment Validation ======
-              echo "✅ Step 8: Validating deployment..."
-
-              HEALTH_CHECK_RETRIES=10
-              HEALTH_CHECK_DELAY=3
-              HEALTH_COUNT=0
-
-              while [ $HEALTH_COUNT -lt $HEALTH_CHECK_RETRIES ]; do
-                if curl -f -s http://"${FRONTEND_PUBLIC_IP}":3000 >/dev/null 2>&1; then
-                  echo "✓ Frontend health check passed"
-                  break
-                fi
-                HEALTH_COUNT=$((HEALTH_COUNT + 1))
-                echo "⏳ Health check retry ${HEALTH_COUNT}/${HEALTH_CHECK_RETRIES}... (waiting ${HEALTH_CHECK_DELAY}s)"
-                sleep ${HEALTH_CHECK_DELAY}
-              done
-
-              if [ $HEALTH_COUNT -eq $HEALTH_CHECK_RETRIES ]; then
-                echo "⚠️  Frontend health check timeout (may still be starting)"
-              else
-                echo "✓ Frontend responding on http://${FRONTEND_PUBLIC_IP}:3000"
-              fi
-
-              echo ""
-              echo "╔════════════════════════════════════════╗"
-              echo "║ ✅ Frontend Deployment Complete       ║"
-              echo "╠════════════════════════════════════════╣"
-              echo "║ URL:      http://${FRONTEND_PUBLIC_IP}:3000"
-              echo "║ Instance: ${FRONTEND_INSTANCE_ID}"
-              echo "╚════════════════════════════════════════╝"
-              echo ""
-              echo "📝 Next steps:"
-              echo "  1. Verify: curl http://${FRONTEND_PUBLIC_IP}:3000"
-              echo "  2. Logs:   ssh -i ${SSH_KEY_PATH} ubuntu@${FRONTEND_PUBLIC_IP}"
-              echo "  3. Container: docker logs dittopedia-frontend"
-
+              echo "✅ Deployment Complete"
               docker logout || true
             '''
           }
-        }
-      }
-      post {
-        failure {
-          echo "❌ AWS frontend deployment failed. Check logs above for details."
         }
       }
     }
@@ -434,33 +349,22 @@ EOF
 
   post {
     always {
+      // Nettoyage des fichiers temporaires
       sh 'rm -f .ssh_ingress_cidr 2>/dev/null || true'
+      
+      // Déconnexion de Docker Hub pour la sécurité
       sh 'docker logout 2>/dev/null || true'
+      
+      // NETTOYAGE DISQUE : Supprime les images intermédiaires (dangling) 
+      // qui n'ont plus de tag (souvent créées par le build précédent)
+      sh 'docker image prune -f'
     }
+    
     failure {
-      echo "❌ Pipeline failed. Review logs above for details."
-      echo "📝 Common issues:"
-      echo "  - Bun not found: Ensure Bun is installed on agent at /usr/local/bin/bun"
-      echo "  - Docker build failed: Check Dockerfile and dependencies"
-      echo "  - AWS deployment: Verify aws-deploy-creds, dockerhub-creds and ssh-ingress-cidr-default are configured"
-      echo "  - SSH timeout: Check security group rules and EC2 instance status"
-      echo "  - Terraform destroy detected: Check for unstable 'count' in security group / key pair resources"
-      echo "  - Missing infra dirs: Create infra-workdir/apps/frontend-aws/terraform and /ansible in dittopedia-infra"
-    }
-    success {
-      echo "✅ Pipeline completed successfully"
-      script {
-        def branchName = env.BRANCH_NAME ?: ''
-        def gitBranch  = env.GIT_BRANCH  ?: ''
-        if (
-          branchName == 'staging-aws-1' || gitBranch == 'staging-aws-1' ||
-          gitBranch == 'origin/staging-aws-1' ||
-          gitBranch == 'refs/remotes/origin/staging-aws-1' ||
-          gitBranch.endsWith('/staging-aws-1')
-        ) {
-          echo "🚀 Frontend deployed to staging. Check AWS console for EC2 instances."
-        }
-      }
+      // Optionnel : En cas d'échec, on peut faire un nettoyage plus profond
+      // pour s'assurer que le prochain build démarre sur une base saine
+      echo "Build failed, performing deep cleanup..."
+      sh 'docker system prune -f --volumes'
     }
   }
 }
