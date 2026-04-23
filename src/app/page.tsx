@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import { API_CONFIG, EBackendStatus } from '@dittopedia/shared';
 import { useEffect, useRef, useState } from 'react';
